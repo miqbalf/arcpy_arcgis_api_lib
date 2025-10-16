@@ -9,9 +9,47 @@ import logging
 from urllib.parse import urlparse
 from typing import Optional
 
+
+import geopandas as gpd
+from shapely import geometry
+from shapely.geometry import Point, Polygon, LineString
+
 # Configure logging
 logger = logging.getLogger(__name__)
 
+######### BACKING UP DATA to GPKG - some data geometry is missing though :( #########
+def backup_data_to_gpkg(list_gdf_to_update, list_layer_to_update, output_dir: str = 'backup_data'):
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"Backing up data to {os.path.join(os.getcwd(), output_dir)}")
+    for i in range(len(list_gdf_to_update)):
+        layer_name = list_layer_to_update[i].replace(' ', '_').replace('-', '_').replace('(', '_').replace(')', '_')
+        gdf = list_gdf_to_update[i].copy()
+        gdf.set_geometry('geometry', inplace=True)
+        gdf = gdf.drop(columns=["SHAPE"])
+        # Ensure CRS is set properly before saving
+        if gdf.crs is None:
+            gdf = gdf.set_crs('EPSG:3857') # hardcoded for now
+            print(f"  -> Set CRS to EPSG:3857 for layer '{layer_name}'")
+
+        geom_type = None
+        for geom in gdf.geometry:
+            if geom is not None and not geom.is_empty:
+                if isinstance(geom, Point):
+                    geom_type = 'point'
+                elif isinstance(geom, Polygon):
+                    geom_type = 'polygon'
+                elif isinstance(geom, LineString):
+                    geom_type = 'line'
+                else:
+                    # For MultiPoint, MultiPolygon, MultiLineString, etc.
+                    geom_type = geom.geom_type.lower()
+                break
+
+        layer_path = os.path.join(output_dir, f"layers_{layer_name}.gpkg")
+        gdf.to_file(layer_path, driver='GPKG', layer=layer_name)
+        print(f"Saved layer '{layer_name}' as {geom_type} geometry to {layer_path}")
+    
+    print(f"Backed up all the layers to {os.path.join(os.getcwd(), output_dir)}")
 
 def download_file_from_url(url: str, temp_dir: Optional[str] = None) -> str:
     """
@@ -35,7 +73,7 @@ def download_file_from_url(url: str, temp_dir: Optional[str] = None) -> str:
         
         # Generate a temporary filename
         parsed_url = urlparse(url)
-        filename = os.path.basename(parsed_url.path) or "downloaded_file.csv"
+        filename = os.path.basename(parsed_url.path) or "downloaded_file.xls"
         temp_file_path = os.path.join(temp_dir, f"temp_{filename}")
         
         logger.info(f"Downloading file from url")
@@ -86,28 +124,28 @@ def is_url(path: str) -> bool:
         return False
 
 
-def validate_csv_path(csv_path: str) -> tuple[str, Optional[str]]:
+def validate_xls_path(xls_path: str) -> tuple[str, Optional[str]]:
     """
-    Validate and process a CSV path (URL or local file).
+    Validate and process a xls path (URL or local file).
     
     Args:
-        csv_path: The CSV path (URL or local file path)
+        xls_path: The xls path (URL or local file path)
         
     Returns:
-        tuple: (actual_csv_path, temp_file_path)
-            - actual_csv_path: The path to use for reading the CSV
+        tuple: (actual_xls_path, temp_file_path)
+            - actual_xls_path: The path to use for reading the xls
             - temp_file_path: The temporary file path if downloaded, None otherwise
             
     Raises:
         FileNotFoundError: If local file doesn't exist
         requests.RequestException: If URL download fails
     """
-    if is_url(csv_path):
-        logger.info("CSV path is a URL, downloading file...")
-        temp_file_path = download_file_from_url(csv_path)
+    if is_url(xls_path):
+        logger.info("xls path is a URL, downloading file...")
+        temp_file_path = download_file_from_url(xls_path)
         return temp_file_path, temp_file_path
     else:
         # Local file path
-        if not os.path.exists(csv_path):
-            raise FileNotFoundError(f"CSV file not found: {csv_path}")
-        return csv_path, None
+        if not os.path.exists(xls_path):
+            raise FileNotFoundError(f"xls file not found: {xls_path}")
+        return xls_path, None

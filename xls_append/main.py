@@ -11,11 +11,12 @@ import geopandas as gpd
 # convert the feature layer arcgis data into geopandas object, it will takes some few minutes
 from arcgis.features import GeoAccessor, GeoSeriesAccessor
 
-from .data_val import (map_df_to_esri, 
+from .data_val import (force_update_dtype_xls, map_df_to_esri, 
                 esri_to_df, compare_df_esri_types, 
                 pandas_to_esri , build_pandera_schema_from_layer, 
-                force_update_dtype_csv, get_missing_columns, column_update_gap, validate_df_against_layer)
-from .utils import validate_csv_path
+                get_missing_columns, column_update_gap, validate_df_against_layer, 
+                multi_filter, graph_office_type, add_missing_fields_to_layer)
+from .utils import validate_xls_path
 
 # from arcgis.mapping import WebMap
 from dotenv import load_dotenv
@@ -37,7 +38,7 @@ class ArcGISAPI:
     """Optimized ArcGIS API wrapper class with improved error handling and performance."""
     
     def __init__(self, api_key: Optional[str] = None, portal_url: Optional[str] = None, 
-                 query: Optional[str] = None, item_type: Optional[str] = None, csv_path: Optional[str] = None):
+                 query: Optional[str] = None, item_type: Optional[str] = None, xls_path: Optional[str] = None):
         """Initialize ArcGIS API connection with lazy loading for better performance."""
         self.portal_url = portal_url or os.getenv('PORTAL_URL')
         self.api_key = api_key or os.getenv('API_KEY')
@@ -57,19 +58,19 @@ class ArcGISAPI:
         self._feature_layer_selected_item = None
         self.list_feature_layer = []  # Fixed: Initialize as empty list, not None
         
-        if csv_path is None:
-            self.csv_path = os.getenv('CSV_PATH')
+        if xls_path is None:
+            self.xls_path = os.getenv('XLS_PATH')
         else:
-            self.csv_path = csv_path     
+            self.xls_path = xls_path     
         
-        if not self.csv_path:
-            raise ValueError("CSV path must be provided either as parameter or CSV_PATH environment variable")
+        if not self.xls_path:
+            raise ValueError("XLS path must be provided either as parameter or XLS_PATH environment variable")
         
         # Handle URL vs local file path using utils
-        actual_csv_path, self._temp_file_path = validate_csv_path(self.csv_path)
+        actual_xls_path, self._temp_file_path = validate_xls_path(self.xls_path)
         
-        self.input_df = pd.read_csv(actual_csv_path)
-        logger.info(f"Successfully loaded CSV with {len(self.input_df)} rows and {len(self.input_df.columns)} columns")
+        self.input_df = pd.read_excel(actual_xls_path)
+        logger.info(f"Successfully loaded XLS with {len(self.input_df)} rows and {len(self.input_df.columns)} columns")
 
         logger.info("ArcGIS API initialized with lazy loading enabled")
 
@@ -352,13 +353,49 @@ class ArcGISAPI:
             return None
 
 
-    def csv_wrangling(self, layer_name: Optional[str] = None, df_reference: Optional[pd.DataFrame] = None, reference_layer=None) -> Optional[pd.DataFrame]:
-        """Load and process CSV data with error handling."""
+    def xls_wrangling(self, layer_name: Optional[str] = None, df_reference: Optional[pd.DataFrame] = None, reference_layer=None, xls_path: Optional[str] = None, query_filter: Optional[Dict[str, List]] = None, auto_add_fields: bool = True,
+    df_input: Optional[pd.DataFrame] = None) -> Optional[pd.DataFrame]:
+        """
+        Load and process XLS data with error handling.
+        
+        Args:
+            layer_name: Name of the layer to process
+            df_reference: Reference DataFrame for type matching
+            reference_layer: Reference feature layer for validation
+            xls_path: Optional path to XLS file (overrides instance path)
+            query_filter: Optional filter conditions
+            auto_add_fields: If True, automatically add missing fields to layer when validation fails. Default: True
+            df_input: Optional input DataFrame (alternative to reading from xls_path)
+        
+        Returns:
+            Dictionary with processing results or None if failed
+        """
         try:
-            
+            if df_input is not None:
+                self.input_df = df_input
+                logger.info(f"Successfully loaded XLS with {len(self.input_df)} rows and {len(self.input_df.columns)} columns")
+            else:
+                if xls_path is not None:
+                    self.input_df = pd.read_excel(xls_path)
+                    logger.info(f"Successfully loaded XLS with {len(self.input_df)} rows and {len(self.input_df.columns)} columns")
+
+            if query_filter is not None:
+                self.input_df = multi_filter(self.input_df, query_filter)
+
+            # specific filter - hardcoded here
+            if 'office_type' in self.input_df.columns:
+                self.input_df['office_type_fe'] = self.input_df.apply(lambda x: 'Country Office' if x['office_type'] == 'Country Office' else 'National Office / Partners', axis =1)
+
+            # Check if both columns exist before creating graph_fe
+            if 'office_type_fe' in self.input_df.columns and 'metric_code' in self.input_df.columns:
+                self.input_df['graph_fe'] = self.input_df.apply(lambda x: graph_office_type(x['metric_code'], x['office_type_fe'], is_polygon=True), axis =1)
+            else:
+                logger.warning("office_type_fe or metric_code not found in the input dataframe")
+                return None
+
             # Add basic data quality checks
             if self.input_df.empty:
-                logger.warning("CSV file is empty")
+                logger.warning("XLS file is empty")
             
             esri_schema_api = self.describe_layer_fields(layer_name)
             if esri_schema_api is None:
@@ -391,12 +428,13 @@ class ArcGISAPI:
             comparison_old = compare_df_esri_types(new_updated_df_revised, esri_schema, pandas_to_esri)
         
             # Apply dtype updates with error handling
-            updated_df = force_update_dtype_csv(new_updated_df_revised, df_reference)
+            # Pass feature_layer to get schema directly from server
+            updated_df = force_update_dtype_xls(new_updated_df_revised, df_reference, feature_layer=reference_layer)
             
-            # Check if force_update_dtype_csv returned valid data
+            # Check if force_update_dtype_xls returned valid data
             if updated_df is None or updated_df.empty:
-                logger.warning("force_update_dtype_csv returned None or empty data. Using original data.")
-                logger.warning("This might indicate a mismatch between CSV data and target layer schema.")
+                logger.warning("force_update_dtype_xls returned None or empty data. Using original data.")
+                logger.warning("This might indicate a mismatch between XLS data and target layer schema.")
                 logger.warning("Please check if metric_code and other fields match the target layer requirements.")
                 
                 # Use the debug method to get detailed information
@@ -411,6 +449,7 @@ class ArcGISAPI:
             comparison_new = compare_df_esri_types(new_updated_df_revised, esri_schema, pandas_to_esri)
             
             # Only perform validation if reference_layer is available and data is valid
+            add_fields_result = None
             if reference_layer is not None and new_updated_df_revised is not None and not new_updated_df_revised.empty:
                 try:
                     validation_schema = build_pandera_schema_from_layer(reference_layer)
@@ -420,8 +459,65 @@ class ArcGISAPI:
                     is_valid = validate_df_against_layer(new_updated_df_revised, reference_layer)
                     print(f"Validation result: {is_valid}")
                 except Exception as e:
-                    print(f"❌ Invalid: {e}")
+                    error_msg = str(e)
+                    print(f"❌ Invalid: {error_msg}")
                     is_valid = False
+                    
+                    # Check if error is about missing columns
+                    if "not in DataFrameSchema" in error_msg or "not in dataframe" in error_msg.lower():
+                        print("\n⚠️ Validation failed due to missing columns in layer schema")
+                        print("🔧 Checking if we can add missing fields to the layer...")
+                        
+                        # First, do a dry run to see what would be added
+                        dry_run_result = add_missing_fields_to_layer(new_updated_df_revised, reference_layer, dry_run=True)
+                        
+                        if dry_run_result.get('success') and dry_run_result.get('fields_to_add'):
+                            print(f"\n📋 Fields that need to be added to layer:")
+                            for field in dry_run_result['fields_to_add']:
+                                print(f"   - {field['name']} ({field['type']}, length={field.get('length', 'N/A')})")
+                            
+                            add_fields_result = dry_run_result
+                            
+                            # Automatically add fields if enabled
+                            if auto_add_fields:
+                                print("\n🔧 Automatically adding fields to layer...")
+                                add_result = add_missing_fields_to_layer(new_updated_df_revised, reference_layer, dry_run=False)
+                                
+                                if add_result.get('success'):
+                                    print(f"✅ Successfully added {len(add_result['fields_added'])} fields: {', '.join(add_result['fields_added'])}")
+                                    add_fields_result = add_result
+                                    
+                                    # Re-validate after adding fields
+                                    print("\n🔍 Re-validating data after adding fields...")
+                                    try:
+                                        # Refresh the layer properties
+                                        if hasattr(reference_layer, 'properties'):
+                                            # Force refresh by accessing properties again
+                                            _ = reference_layer.properties
+                                        
+                                        validation_schema = build_pandera_schema_from_layer(reference_layer)
+                                        validation_schema.validate(new_updated_df_revised)
+                                        print("✅✅ Valid after adding fields!")
+                                        
+                                        is_valid = validate_df_against_layer(new_updated_df_revised, reference_layer)
+                                        print(f"Validation result: {is_valid}")
+                                    except Exception as revalidation_error:
+                                        print(f"⚠️ Re-validation failed: {revalidation_error}")
+                                        print("Note: You may need to refresh the layer reference manually")
+                                        is_valid = False
+                                else:
+                                    print(f"❌ Failed to add fields: {add_result.get('error')}")
+                                    print("\nPossible causes:")
+                                    print("  - Insufficient permissions (need write access)")
+                                    print("  - Layer doesn't support schema modifications")
+                                    print("  - Service restrictions")
+                                    print("\n💡 Manual fix: Set auto_add_fields=False and add fields manually")
+                            else:
+                                print("\n💡 To add these fields to the layer, call:")
+                                print("   result = add_missing_fields_to_layer(df, feature_layer, dry_run=False)")
+                                print("   Or set auto_add_fields=True in xls_wrangling()")
+                        else:
+                            print("ℹ️ No fields need to be added or unable to determine missing fields")
             else:
                 if reference_layer is None:
                     print("⚠️ No reference layer available for validation")
@@ -429,12 +525,12 @@ class ArcGISAPI:
                     print("⚠️ No valid data available for validation")
                 is_valid = None
 
-            # Only update self.input_df if we have valid data
-            if new_updated_df_revised is not None and not new_updated_df_revised.empty:
-                self.input_df = new_updated_df_revised
-            else:
-                logger.warning("Keeping original input_df due to invalid processed data")
-                # Keep the original input_df unchanged
+            # # Only update self.input_df if we have valid data
+            # if new_updated_df_revised is not None and not new_updated_df_revised.empty:
+            #     self.input_df = new_updated_df_revised
+            # else:
+            #     logger.warning("Keeping original input_df due to invalid processed data")
+            #     # Keep the original input_df unchanged
 
             return {'mapped_df_esri': mapped_df_esri,
                     'mapped_esri_df':mapped_esri_df,
@@ -442,20 +538,21 @@ class ArcGISAPI:
                     'comparison_new':comparison_new,
                     'is_valid':is_valid,
                     'new_updated_df_revised':new_updated_df_revised,
-                    'data_processing_successful': new_updated_df_revised is not None and not new_updated_df_revised.empty
+                    'data_processing_successful': new_updated_df_revised is not None and not new_updated_df_revised.empty,
+                    'add_fields_result': add_fields_result
 
                     }
             
         except Exception as e:
-            logger.error(f"Failed to process CSV file: {e}")
+            logger.error(f"Failed to process XLS file: {e}")
             return None
     
     def debug_data_mismatch(self, csv_df: pd.DataFrame, reference_df: Optional[pd.DataFrame] = None, layer_name: Optional[str] = None) -> Dict[str, Any]:
         """
-        Debug method to help identify data mismatches between CSV and target layer.
+        Debug method to help identify data mismatches between XLS and target layer.
         
         Args:
-            csv_df: The CSV DataFrame
+            csv_df: The XLS DataFrame
             reference_df: Optional reference DataFrame from the layer
             layer_name: Optional layer name for context
             
