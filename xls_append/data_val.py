@@ -47,13 +47,18 @@ def get_pandera_type(esri_type_str: str, coerce: bool = True) -> pa.DataType:
     
     return result
 
-def build_pandera_schema_from_layer(feature_layer, coerce: bool = True) -> Optional[pa.DataFrameSchema]:
+def build_pandera_schema_from_layer(
+    feature_layer,
+    coerce: bool = True,
+    strict: bool = True,
+) -> Optional[pa.DataFrameSchema]:
     """
     Dynamically builds a Pandera DataFrameSchema from an ArcGIS Feature Layer.
 
     Args:
         feature_layer: The target Esri Feature Layer.
         coerce: If True, enables type coercion during validation (recommended). Default: True
+        strict: If True, fail when the DataFrame has columns not defined on the layer. Default True.
 
     Returns:
         pandera.DataFrameSchema: A schema object for validating DataFrames.
@@ -157,10 +162,9 @@ def build_pandera_schema_from_layer(feature_layer, coerce: bool = True) -> Optio
             )
             logger.info(f"  -> Adding rule for field '{field_name}': Type={pandera_type}, Nullable={nullable}, Coerce={coerce}")
 
-        # strict=True will fail if DataFrame has columns not in the target layer
-        # This ensures validation catches mismatches between DataFrame and layer schema
-        # coerce=True allows automatic type conversion (e.g., int64 -> int32)
-        schema = pa.DataFrameSchema(columns_to_validate, strict=True, ordered=False, coerce=coerce)
+        # strict=True: fail on extra DataFrame columns. strict=False: ignore extra columns (e.g. joined
+        # attributes not hosted on the layer) while still validating overlapping fields — use False for uploads.
+        schema = pa.DataFrameSchema(columns_to_validate, strict=strict, ordered=False, coerce=coerce)
         logger.info(f"Successfully built schema with {len(columns_to_validate)} fields")
         
         # Debug: Show what fields were included/excluded
@@ -707,26 +711,67 @@ def get_missing_columns(df: pd.DataFrame, feature_layer) -> Dict[str, List[str]]
         logger.error(f"Error in get_missing_columns: {e}")
         return {"missing_in_df": [], "extra_in_df": []}
 
-def validate_df_against_layer(df: pd.DataFrame, feature_layer) -> bool:
+def pandera_validation_error_to_dict(exc: BaseException) -> Dict[str, Any]:
+    """Serialize Pandera validation errors for API responses (message + failure_cases if present)."""
+    out: Dict[str, Any] = {"message": str(exc)}
+    fc = getattr(exc, "failure_cases", None)
+    if fc is not None:
+        try:
+            if hasattr(fc, "empty") and not fc.empty and hasattr(fc, "to_dict"):
+                out["failure_cases"] = fc.to_dict(orient="records")
+        except Exception:
+            logger.debug("Could not serialize pandera failure_cases", exc_info=True)
+    return out
+
+
+def validate_df_against_layer(
+    df: pd.DataFrame,
+    feature_layer,
+    strict: bool = True,
+) -> bool:
     """
-    Simple validation function that returns True if DataFrame matches layer schema, False otherwise.
-    
+    Returns True if DataFrame passes Pandera validation against the layer schema.
+
     Args:
         df: Pandas DataFrame to validate
         feature_layer: ArcGIS Feature Layer to validate against
-    
-    Returns:
-        bool: True if valid, False if invalid
+        strict: Passed to schema build; False allows extra columns in df (not on layer).
     """
     try:
-        schema = build_pandera_schema_from_layer(feature_layer)
+        schema = build_pandera_schema_from_layer(feature_layer, strict=strict)
         if schema is None:
             return False
-        
+
         schema.validate(df)
         return True
     except Exception:
         return False
+
+
+def validate_df_against_layer_with_details(
+    df: pd.DataFrame,
+    feature_layer,
+    strict: bool = True,
+) -> Dict[str, Any]:
+    """
+    Same as validate_df_against_layer but returns ok flag and error payload (for APIs).
+    """
+    try:
+        schema = build_pandera_schema_from_layer(feature_layer, strict=strict)
+        if schema is None:
+            return {
+                "ok": False,
+                "error": "Could not build schema from layer properties",
+                "pandera_error": None,
+            }
+        schema.validate(df)
+        return {"ok": True, "error": None, "pandera_error": None}
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+            "pandera_error": pandera_validation_error_to_dict(exc),
+        }
 
 def graph_office_type(metric_code, office_type_fe,is_polygon=True):
 

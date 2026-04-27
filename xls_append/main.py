@@ -11,10 +11,11 @@ import geopandas as gpd
 # convert the feature layer arcgis data into geopandas object, it will takes some few minutes
 from arcgis.features import GeoAccessor, GeoSeriesAccessor
 
-from .data_val import (force_update_dtype_xls, map_df_to_esri, 
-                esri_to_df, compare_df_esri_types, 
-                pandas_to_esri , build_pandera_schema_from_layer, 
-                get_missing_columns, column_update_gap, validate_df_against_layer, 
+from .data_val import (force_update_dtype_xls, map_df_to_esri,
+                esri_to_df, compare_df_esri_types,
+                pandas_to_esri,
+                get_missing_columns, column_update_gap,
+                validate_df_against_layer_with_details,
                 multi_filter, graph_office_type, add_missing_fields_to_layer)
 from .utils import validate_xls_path
 
@@ -353,8 +354,16 @@ class ArcGISAPI:
             return None
 
 
-    def xls_wrangling(self, layer_name: Optional[str] = None, df_reference: Optional[pd.DataFrame] = None, reference_layer=None, xls_path: Optional[str] = None, query_filter: Optional[Dict[str, List]] = None, auto_add_fields: bool = True,
-    df_input: Optional[pd.DataFrame] = None) -> Optional[pd.DataFrame]:
+    def xls_wrangling(
+        self,
+        layer_name: Optional[str] = None,
+        df_reference: Optional[pd.DataFrame] = None,
+        reference_layer=None,
+        xls_path: Optional[str] = None,
+        query_filter: Optional[Dict[str, List]] = None,
+        auto_add_fields: bool = True,
+        df_input: Optional[pd.DataFrame] = None,
+    ) -> Optional[pd.DataFrame]:
         """
         Load and process XLS data with error handling.
         
@@ -373,176 +382,172 @@ class ArcGISAPI:
         try:
             if df_input is not None:
                 self.input_df = df_input
-                logger.info(f"Successfully loaded XLS with {len(self.input_df)} rows and {len(self.input_df.columns)} columns")
-            else:
-                if xls_path is not None:
-                    self.input_df = pd.read_excel(xls_path)
-                    logger.info(f"Successfully loaded XLS with {len(self.input_df)} rows and {len(self.input_df.columns)} columns")
+            elif xls_path is not None:
+                self.input_df = pd.read_excel(xls_path)
+            logger.info(
+                f"Successfully loaded XLS with {len(self.input_df)} rows and {len(self.input_df.columns)} columns"
+            )
 
             if query_filter is not None:
                 self.input_df = multi_filter(self.input_df, query_filter)
 
-            # specific filter - hardcoded here
-            if 'office_type' in self.input_df.columns:
-                self.input_df['office_type_fe'] = self.input_df.apply(lambda x: 'Country Office' if x['office_type'] == 'Country Office' else 'National Office / Partners', axis =1)
+            if "office_type" in self.input_df.columns:
+                self.input_df["office_type_fe"] = self.input_df["office_type"].apply(
+                    lambda v: "Country Office" if v == "Country Office" else "National Office / Partners"
+                )
 
-            # Check if both columns exist before creating graph_fe
-            if 'office_type_fe' in self.input_df.columns and 'metric_code' in self.input_df.columns:
-                self.input_df['graph_fe'] = self.input_df.apply(lambda x: graph_office_type(x['metric_code'], x['office_type_fe'], is_polygon=True), axis =1)
-            else:
+            if "office_type_fe" not in self.input_df.columns or "metric_code" not in self.input_df.columns:
                 logger.warning("office_type_fe or metric_code not found in the input dataframe")
                 return None
 
-            # Add basic data quality checks
+            self.input_df["graph_fe"] = self.input_df.apply(
+                lambda x: graph_office_type(x["metric_code"], x["office_type_fe"], is_polygon=True),
+                axis=1,
+            )
+
             if self.input_df.empty:
                 logger.warning("XLS file is empty")
-            
+
             esri_schema_api = self.describe_layer_fields(layer_name)
             if esri_schema_api is None:
                 raise ValueError(f"Could not retrieve schema for layer: {layer_name}")
-            esri_schema = {i['name']:i['type'] for i in esri_schema_api}
+            esri_schema = {i["name"]: i["type"] for i in esri_schema_api}
 
             mapped_df_esri = map_df_to_esri(self.input_df, esri_schema)
-            # mapped_df_esri
-
             mapped_esri_df = esri_to_df(self.input_df, esri_schema)
 
-            # Get the feature layer for reference if not provided
             if reference_layer is None and layer_name is not None:
                 result = self.get_feature_layer_tile_by_name(layer_name)
-                if result:
-                    reference_layer = result[1]  # Get the feature layer (second element of tuple)
-                else:
+                if not result:
                     raise ValueError(f"Could not retrieve feature layer for: {layer_name}")
+                reference_layer = result[1]
 
             col_not_exist_not_system = get_missing_columns(self.input_df, reference_layer)
-
-            # repair, adding the data first, if there is any col missing
-            if col_not_exist_not_system and col_not_exist_not_system.get('missing_in_df'):
-                new_updated_df_revised = column_update_gap(self.input_df,col_not_exist_not_system['missing_in_df'])
+            if col_not_exist_not_system and col_not_exist_not_system.get("missing_in_df"):
+                new_updated_df_revised = column_update_gap(
+                    self.input_df, col_not_exist_not_system["missing_in_df"]
+                )
             else:
                 new_updated_df_revised = self.input_df
 
-            # new_updated_df_revised.columns
-
             comparison_old = compare_df_esri_types(new_updated_df_revised, esri_schema, pandas_to_esri)
-        
-            # Apply dtype updates with error handling
-            # Pass feature_layer to get schema directly from server
-            updated_df = force_update_dtype_xls(new_updated_df_revised, df_reference, feature_layer=reference_layer)
-            
-            # Check if force_update_dtype_xls returned valid data
+
+            updated_df = force_update_dtype_xls(
+                new_updated_df_revised,
+                df_reference,
+                feature_layer=reference_layer,
+            )
             if updated_df is None or updated_df.empty:
                 logger.warning("force_update_dtype_xls returned None or empty data. Using original data.")
                 logger.warning("This might indicate a mismatch between XLS data and target layer schema.")
                 logger.warning("Please check if metric_code and other fields match the target layer requirements.")
-                
-                # Use the debug method to get detailed information
                 self.debug_data_mismatch(new_updated_df_revised, df_reference, layer_name)
-                
-                # Keep the original data instead of None
-                new_updated_df_revised = new_updated_df_revised
             else:
                 new_updated_df_revised = updated_df
                 logger.info(f"Successfully updated data types. New shape: {new_updated_df_revised.shape}")
-                
+
             comparison_new = compare_df_esri_types(new_updated_df_revised, esri_schema, pandas_to_esri)
-            
-            # Only perform validation if reference_layer is available and data is valid
+
             add_fields_result = None
-            if reference_layer is not None and new_updated_df_revised is not None and not new_updated_df_revised.empty:
-                try:
-                    validation_schema = build_pandera_schema_from_layer(reference_layer)
-                    validation_schema.validate(new_updated_df_revised)
+            is_valid = None
+            validation_report: Dict[str, Any] = {}
+
+            # Joined polygon rows include many source columns not hosted on the layer.
+            # strict=False validates overlapping layer fields only; extra join columns are not a failure.
+            _validate_strict = False
+
+            if reference_layer is None:
+                print("⚠️ No reference layer available for validation")
+                validation_report = {"reason": "no_reference_layer"}
+            elif new_updated_df_revised is None or new_updated_df_revised.empty:
+                print("⚠️ No valid data available for validation")
+                validation_report = {"reason": "empty_dataframe"}
+            else:
+                col_diff = get_missing_columns(new_updated_df_revised, reference_layer)
+                validation_report = {
+                    "schema_allows_extra_dataframe_columns": not _validate_strict,
+                    "columns_extra_in_dataframe": sorted(col_diff.get("extra_in_df") or []),
+                    "columns_missing_in_dataframe": sorted(col_diff.get("missing_in_df") or []),
+                }
+
+                details = validate_df_against_layer_with_details(
+                    new_updated_df_revised, reference_layer, strict=_validate_strict
+                )
+
+                if details["ok"]:
+                    is_valid = True
+                    validation_report["pandera_ok"] = True
+                    if validation_report["columns_extra_in_dataframe"]:
+                        validation_report["note"] = (
+                            "Extra join columns are not fields on the hosted layer; "
+                            "they are ignored for validation (schema strict=False)."
+                        )
                     print("✅ Valid!")
-                    
-                    is_valid = validate_df_against_layer(new_updated_df_revised, reference_layer)
-                    print(f"Validation result: {is_valid}")
-                except Exception as e:
-                    error_msg = str(e)
-                    print(f"❌ Invalid: {error_msg}")
+                else:
+                    error_msg = details.get("error") or ""
                     is_valid = False
-                    
-                    # Check if error is about missing columns
-                    if "not in DataFrameSchema" in error_msg or "not in dataframe" in error_msg.lower():
-                        print("\n⚠️ Validation failed due to missing columns in layer schema")
-                        print("🔧 Checking if we can add missing fields to the layer...")
-                        
-                        # First, do a dry run to see what would be added
-                        dry_run_result = add_missing_fields_to_layer(new_updated_df_revised, reference_layer, dry_run=True)
-                        
-                        if dry_run_result.get('success') and dry_run_result.get('fields_to_add'):
-                            print(f"\n📋 Fields that need to be added to layer:")
-                            for field in dry_run_result['fields_to_add']:
-                                print(f"   - {field['name']} ({field['type']}, length={field.get('length', 'N/A')})")
-                            
+                    validation_report["pandera_ok"] = False
+                    validation_report["pandera_error"] = details.get("pandera_error") or {
+                        "message": error_msg
+                    }
+
+                    missing_cols_error = (
+                        "not in DataFrameSchema" in error_msg
+                        or "not in dataframe" in error_msg.lower()
+                    )
+                    if missing_cols_error:
+                        print("\n⚠️ Validation failed (schema); checking for fields to add on service...")
+                        dry_run_result = add_missing_fields_to_layer(
+                            new_updated_df_revised, reference_layer, dry_run=True
+                        )
+
+                        if dry_run_result.get("success") and dry_run_result.get("fields_to_add"):
+                            for field in dry_run_result["fields_to_add"]:
+                                print(
+                                    f"   - {field['name']} ({field['type']}, length={field.get('length', 'N/A')})"
+                                )
                             add_fields_result = dry_run_result
-                            
-                            # Automatically add fields if enabled
+
                             if auto_add_fields:
-                                print("\n🔧 Automatically adding fields to layer...")
-                                add_result = add_missing_fields_to_layer(new_updated_df_revised, reference_layer, dry_run=False)
-                                
-                                if add_result.get('success'):
-                                    print(f"✅ Successfully added {len(add_result['fields_added'])} fields: {', '.join(add_result['fields_added'])}")
+                                add_result = add_missing_fields_to_layer(
+                                    new_updated_df_revised, reference_layer, dry_run=False
+                                )
+                                if add_result.get("success"):
                                     add_fields_result = add_result
-                                    
-                                    # Re-validate after adding fields
-                                    print("\n🔍 Re-validating data after adding fields...")
-                                    try:
-                                        # Refresh the layer properties
-                                        if hasattr(reference_layer, 'properties'):
-                                            # Force refresh by accessing properties again
-                                            _ = reference_layer.properties
-                                        
-                                        validation_schema = build_pandera_schema_from_layer(reference_layer)
-                                        validation_schema.validate(new_updated_df_revised)
-                                        print("✅✅ Valid after adding fields!")
-                                        
-                                        is_valid = validate_df_against_layer(new_updated_df_revised, reference_layer)
-                                        print(f"Validation result: {is_valid}")
-                                    except Exception as revalidation_error:
-                                        print(f"⚠️ Re-validation failed: {revalidation_error}")
-                                        print("Note: You may need to refresh the layer reference manually")
+                                    if hasattr(reference_layer, "properties"):
+                                        _ = reference_layer.properties
+                                    details2 = validate_df_against_layer_with_details(
+                                        new_updated_df_revised, reference_layer, strict=_validate_strict
+                                    )
+                                    validation_report["after_auto_add_fields"] = details2
+                                    if details2["ok"]:
+                                        is_valid = True
+                                        validation_report["pandera_ok"] = True
+                                        validation_report["pandera_error"] = None
+                                    else:
                                         is_valid = False
+                                        validation_report["pandera_ok"] = False
+                                        validation_report["pandera_error"] = details2.get(
+                                            "pandera_error"
+                                        ) or {"message": details2.get("error")}
                                 else:
                                     print(f"❌ Failed to add fields: {add_result.get('error')}")
-                                    print("\nPossible causes:")
-                                    print("  - Insufficient permissions (need write access)")
-                                    print("  - Layer doesn't support schema modifications")
-                                    print("  - Service restrictions")
-                                    print("\n💡 Manual fix: Set auto_add_fields=False and add fields manually")
                             else:
-                                print("\n💡 To add these fields to the layer, call:")
-                                print("   result = add_missing_fields_to_layer(df, feature_layer, dry_run=False)")
-                                print("   Or set auto_add_fields=True in xls_wrangling()")
+                                print("auto_add_fields=False; add fields manually if needed.")
                         else:
-                            print("ℹ️ No fields need to be added or unable to determine missing fields")
-            else:
-                if reference_layer is None:
-                    print("⚠️ No reference layer available for validation")
-                elif new_updated_df_revised is None or new_updated_df_revised.empty:
-                    print("⚠️ No valid data available for validation")
-                is_valid = None
+                            print("ℹ️ No service fields to add from dry run.")
 
-            # # Only update self.input_df if we have valid data
-            # if new_updated_df_revised is not None and not new_updated_df_revised.empty:
-            #     self.input_df = new_updated_df_revised
-            # else:
-            #     logger.warning("Keeping original input_df due to invalid processed data")
-            #     # Keep the original input_df unchanged
-
-            return {'mapped_df_esri': mapped_df_esri,
-                    'mapped_esri_df':mapped_esri_df,
-                    'comparison_old':comparison_old,
-                    'comparison_new':comparison_new,
-                    'is_valid':is_valid,
-                    'new_updated_df_revised':new_updated_df_revised,
-                    'data_processing_successful': new_updated_df_revised is not None and not new_updated_df_revised.empty,
-                    'add_fields_result': add_fields_result
-
-                    }
-            
+            return {
+                "mapped_df_esri": mapped_df_esri,
+                "mapped_esri_df": mapped_esri_df,
+                "comparison_old": comparison_old,
+                "comparison_new": comparison_new,
+                "is_valid": is_valid,
+                "new_updated_df_revised": new_updated_df_revised,
+                "data_processing_successful": new_updated_df_revised is not None and not new_updated_df_revised.empty,
+                "add_fields_result": add_fields_result,
+                "validation_report": validation_report,
+            }
         except Exception as e:
             logger.error(f"Failed to process XLS file: {e}")
             return None
