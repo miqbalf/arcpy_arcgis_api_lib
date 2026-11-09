@@ -5,13 +5,10 @@ from functools import lru_cache
 import re
 
 from arcgis.gis import GIS
-from arcgis.layers import Service
 from dotenv import dotenv_values
 
 import pandas as pd
 import geopandas as gpd
-# convert the feature layer arcgis data into geopandas object, it will takes some few minutes
-from arcgis.features import GeoAccessor, GeoSeriesAccessor
 
 from .data_val import (force_update_dtype_xls, map_df_to_esri,
                 esri_to_df, compare_df_esri_types,
