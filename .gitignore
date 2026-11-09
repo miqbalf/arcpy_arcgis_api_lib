@@ -142,6 +142,9 @@ query*
 backup_data/
 backup_data/** */
 
+# Local clone job status dumps
+clone_status/
+
 # Environments
 .env
 .envrc
